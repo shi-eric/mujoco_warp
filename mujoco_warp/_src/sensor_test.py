@@ -42,6 +42,22 @@ def _assert_eq(a, b, name):
   np.testing.assert_allclose(a, b, err_msg=err_msg, atol=tol, rtol=tol)
 
 
+def _assert_sensor_stages(mjm, mjds, m, d):
+  d.sensordata.fill_(wp.inf)
+  for mjd in mjds:
+    mjd.sensordata.fill(np.inf)
+  for mj_sensor, sensor in (
+    (mujoco.mj_sensorPos, mjw.sensor_pos),
+    (mujoco.mj_sensorVel, mjw.sensor_vel),
+    (mujoco.mj_sensorAcc, mjw.sensor_acc),
+  ):
+    sensor(m, d)
+    sensordata = d.sensordata.numpy()
+    for worldid, mjd in enumerate(mjds):
+      mj_sensor(mjm, mjd)
+      _assert_eq(sensordata[worldid], mjd.sensordata, f"{mj_sensor.__name__}_world_{worldid}")
+
+
 class SensorTest(parameterized.TestCase):
   def setUp(self):
     super().setUp()
@@ -482,6 +498,111 @@ class SensorTest(parameterized.TestCase):
     mjw.energy_vel(m, d)
     _assert_eq(d.energy.numpy()[0][1], mjd.energy[1], "kinetic energy")
 
+  @parameterized.parameters(1, 2)
+  def test_contact_tactile_sensor_stages(self, nworld):
+    """Compute contact and tactile sensors only in the stages required by MuJoCo."""
+    mjm, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <asset>
+          <mesh name="sensor_mesh" builtin="sphere" params="0"/>
+        </asset>
+        <worldbody>
+          <!-- Tilt the mesh to avoid ties in contact reduction. -->
+          <body pos="0 0 1" euler="3 5 7">
+            <freejoint/>
+            <geom name="sensor_geom" type="mesh" mesh="sensor_mesh" mass="1"/>
+          </body>
+          <body>
+            <geom type="box" size=".7 .7 .3"/>
+          </body>
+        </worldbody>
+        <sensor>
+          <contact data="found"/>
+          <contact data="dist pos normal tangent" reduce="mindist"/>
+          <contact data="found force torque"/>
+          <contact data="found" reduce="maxforce"/>
+          <tactile geom="sensor_geom" mesh="sensor_mesh"/>
+        </sensor>
+      </mujoco>
+      """,
+      nworld=nworld,
+    )
+    qpos = d.qpos.numpy()
+    qvel = d.qvel.numpy()
+    qvel[:, 0] = 0.1
+    if nworld == 2:
+      qpos[1, 2] = 0.9
+      qvel[1, 0] = 0.2
+    d.qpos.assign(qpos)
+    d.qvel.assign(qvel)
+    mjw.forward(m, d)
+
+    mjds = []
+    for worldid in range(nworld):
+      mjd = mujoco.MjData(mjm)
+      mjd.qpos[:] = qpos[worldid]
+      mjd.qvel[:] = qvel[worldid]
+      mujoco.mj_forward(mjm, mjd)
+      mjds.append(mjd)
+
+    _assert_sensor_stages(mjm, mjds, m, d)
+    if nworld == 2:
+      self.assertFalse(np.allclose(d.sensordata.numpy()[0], d.sensordata.numpy()[1]))
+
+  @parameterized.parameters(1, 2)
+  def test_contact_tactile_sensor_delay(self, nworld):
+    """Record fresh contact and tactile values before reading delayed samples."""
+    mjm, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option timestep=".01"/>
+        <asset>
+          <mesh name="sensor_mesh" builtin="sphere" params="0"/>
+        </asset>
+        <worldbody>
+          <body pos="0 0 1">
+            <freejoint/>
+            <geom name="sensor_geom" type="mesh" mesh="sensor_mesh" mass="1"/>
+          </body>
+          <body>
+            <geom type="box" size=".7 .7 .3"/>
+          </body>
+        </worldbody>
+        <sensor>
+          <contact data="dist" reduce="mindist" delay=".02" nsample="3"/>
+          <contact data="force" delay=".02" nsample="3"/>
+          <tactile geom="sensor_geom" mesh="sensor_mesh" delay=".02" nsample="3"/>
+        </sensor>
+      </mujoco>
+      """,
+      nworld=nworld,
+    )
+    mjds = [mujoco.MjData(mjm) for _ in range(nworld)]
+    for mjd in mjds:
+      mujoco.mj_forward(mjm, mjd)
+      mjd.qacc_warmstart[:] = mjd.qacc
+
+    for stepid in range(4):
+      qpos = np.tile(mjm.qpos0, (nworld, 1))
+      qpos[:, 2] -= 0.05 * stepid
+      if nworld == 2:
+        qpos[1, 2] -= 0.1
+      d.qpos.assign(qpos)
+      d.qvel.zero_()
+      d.sensordata.fill_(wp.inf)
+      mjw.step(m, d)
+      sensordata = d.sensordata.numpy()
+      for worldid, mjd in enumerate(mjds):
+        mjd.qpos[:] = qpos[worldid]
+        mjd.qvel.fill(0)
+        mujoco.mj_step(mjm, mjd)
+        _assert_eq(sensordata[worldid], mjd.sensordata, f"delayed_sensors_step_{stepid}_world_{worldid}")
+
+    self.assertTrue(sensordata[0].any())
+    if nworld == 2:
+      self.assertFalse(np.allclose(sensordata[0], sensordata[1]))
+
   @parameterized.parameters(
     'type="capsule" size=".1 .1" euler="0 89 89"',
     'type="box" size=".1 .11 .12" euler=".02 .05 .1"',
@@ -539,6 +660,7 @@ class SensorTest(parameterized.TestCase):
     _, mjd, m, d = test_data.fixture(xml=_MJCF, keyframe=0)
 
     d.sensordata.zero_()
+    mjw.sensor_pos(m, d)
     mjw.sensor_acc(m, d)
 
     sensordata = d.sensordata.numpy()[0]
@@ -581,6 +703,7 @@ class SensorTest(parameterized.TestCase):
     _, _, m, d = test_data.fixture(xml=_MJCF, keyframe=0)
 
     d.sensordata.zero_()
+    mjw.sensor_pos(m, d)
     mjw.sensor_acc(m, d)
 
     _assert_eq(d.sensordata.numpy()[0], np.array([4, 4, 4, 2, 1, 0, 1]), "found")
@@ -616,6 +739,7 @@ class SensorTest(parameterized.TestCase):
     _, _, m, d = test_data.fixture(xml=_MJCF, keyframe=0)
 
     d.sensordata.fill_(wp.inf)
+    mjw.sensor_pos(m, d)
     mjw.sensor_acc(m, d)
 
     _assert_eq(d.nacon.numpy()[0], 2, "nacon")
@@ -646,6 +770,7 @@ class SensorTest(parameterized.TestCase):
     )
 
     d.sensordata.zero_()
+    mjw.sensor_pos(m, d)
     mjw.sensor_acc(m, d)
 
     _assert_eq(d.sensordata.numpy()[0], mjd.sensordata, "sensordata")
@@ -675,6 +800,7 @@ class SensorTest(parameterized.TestCase):
     )
 
     d.sensordata.zero_()
+    mjw.sensor_pos(m, d)
     mjw.sensor_acc(m, d)
     sensordata = d.sensordata.numpy()[0]
     _assert_eq(sensordata, mjd.sensordata, "sensordata")
@@ -934,6 +1060,7 @@ class SensorTest(parameterized.TestCase):
     )
 
     d.sensordata.fill_(wp.inf)
+    mjw.sensor_vel(m, d)
     mjw.sensor_acc(m, d)
 
     warp_sensordata = d.sensordata.numpy()
@@ -976,9 +1103,11 @@ class SensorTest(parameterized.TestCase):
     # set on mjModel.
     mjm.sensor_cutoff[0] = cutoff_val
     m.sensor_cutoff.fill_(cutoff_val)
+    mujoco.mj_sensorVel(mjm, mjd)
     mujoco.mj_sensorAcc(mjm, mjd)
 
     d.sensordata.fill_(wp.inf)
+    mjw.sensor_vel(m, d)
     mjw.sensor_acc(m, d)
 
     sensordata = d.sensordata.numpy()
@@ -1235,6 +1364,7 @@ class SensorTest(parameterized.TestCase):
 
     d.overflow.fill_(0)
     d.sensordata.fill_(wp.inf)
+    mjw.sensor_vel(m, d)
     mjw.sensor_acc(m, d)
 
     # Overflow should NOT be set because there are only 2 distinct contacting geoms
@@ -1242,6 +1372,7 @@ class SensorTest(parameterized.TestCase):
     for w in range(nworld):
       self.assertFalse(bool(overflow_vals[w] & OverflowType.TACTILE), f"Overflow set for world {w}")
 
+    mujoco.mj_sensorVel(mjm, mjd)
     mujoco.mj_sensorAcc(mjm, mjd)
     sensordata = d.sensordata.numpy()
     for w in range(nworld):
