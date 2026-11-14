@@ -751,8 +751,7 @@ class SetConstTest(parameterized.TestCase):
     self.assertFalse(all(np.allclose(before[f], expected[f]) for f in outputs))
 
     for f in _setconst_output_fields(*group_names, pure_only=True):
-      arr = getattr(m, f)
-      arr.assign(np.full(arr.numpy().shape, np.inf, dtype=np.float32))
+      getattr(m, f).fill_(wp.inf)
 
     wp.capture_launch(capture.graph)
 
